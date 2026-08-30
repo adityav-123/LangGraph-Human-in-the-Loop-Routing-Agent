@@ -2,7 +2,7 @@
 Unit tests for LangGraph nodes.
 
 Run: pytest tests/test_graph.py -v
-These tests mock the Anthropic API so they run without credentials.
+These tests mock the Gemini client so they run without credentials.
 """
 
 import pytest
@@ -44,12 +44,10 @@ def make_state(**overrides) -> DocumentState:
     return {**base, **overrides}
 
 
-def mock_claude_response(text: str):
-    """Build a minimal mock Anthropic response."""
-    content_block = MagicMock()
-    content_block.text = text
+def mock_gemini_response(text: str):
+    """Build a minimal mock Gemini response."""
     response = MagicMock()
-    response.content = [content_block]
+    response.text = text
     return response
 
 
@@ -61,7 +59,7 @@ class TestClassify:
 
     @patch("backend.agents.nodes.client")
     def test_classifies_invoice(self, mock_client):
-        mock_client.messages.create.return_value = mock_claude_response(
+        mock_client.models.generate_content.return_value = mock_gemini_response(
             '{"doc_type": "invoice", "urgency": "normal", "confidence": 0.95, "reasoning": "Standard invoice format."}'
         )
         state  = make_state()
@@ -75,7 +73,7 @@ class TestClassify:
 
     @patch("backend.agents.nodes.client")
     def test_handles_parse_error(self, mock_client):
-        mock_client.messages.create.return_value = mock_claude_response("not valid json at all")
+        mock_client.models.generate_content.return_value = mock_gemini_response("not valid json at all")
         state  = make_state()
         result = classify(state)
 
@@ -86,7 +84,7 @@ class TestClassify:
 
     @patch("backend.agents.nodes.client")
     def test_classifies_critical_legal(self, mock_client):
-        mock_client.messages.create.return_value = mock_claude_response(
+        mock_client.models.generate_content.return_value = mock_gemini_response(
             '{"doc_type": "legal_notice", "urgency": "critical", "confidence": 0.88, "reasoning": "Court deadline."}'
         )
         state  = make_state(raw_text="Court order: response required within 24 hours.")
@@ -160,7 +158,7 @@ class TestExtractMetadata:
 
     @patch("backend.agents.nodes.client")
     def test_extracts_parties_and_amounts(self, mock_client):
-        mock_client.messages.create.return_value = mock_claude_response(
+        mock_client.models.generate_content.return_value = mock_gemini_response(
             '{"parties": ["Acme Corp", "BuyerCo"], "key_dates": ["2026-09-01"], '
             '"monetary_amounts": ["$5,000"], "summary": "Invoice from Acme. Payment due Sept 1."}'
         )
@@ -173,7 +171,7 @@ class TestExtractMetadata:
 
     @patch("backend.agents.nodes.client")
     def test_handles_empty_result(self, mock_client):
-        mock_client.messages.create.return_value = mock_claude_response(
+        mock_client.models.generate_content.return_value = mock_gemini_response(
             '{"parties": [], "key_dates": [], "monetary_amounts": [], "summary": ""}'
         )
         state  = make_state()

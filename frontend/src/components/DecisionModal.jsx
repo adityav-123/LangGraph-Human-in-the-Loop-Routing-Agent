@@ -1,10 +1,28 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
-export function DecisionModal({ doc, API, onClose, onDecision }) {
+export function DecisionModal({ doc: initialDoc, API, token, onClose, onDecision }) {
+  const [doc, setDoc] = useState(initialDoc);
   const [notes, setNotes] = useState("");
   const [rerouteTo, setReroute] = useState("finance");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [loadingDetails, setLoadingDetails] = useState(true);
+
+  useEffect(() => {
+    async function fetchDetails() {
+      try {
+        const res = await fetch(`${API}/documents/${initialDoc.document_id}`, {
+          headers: { "Authorization": `Bearer ${token}` }
+        });
+        if (res.ok) setDoc(await res.json());
+      } catch (e) {
+        console.error(e);
+      } finally {
+        setLoadingDetails(false);
+      }
+    }
+    fetchDetails();
+  }, [initialDoc.document_id, API, token]);
 
   const submit = async (action) => {
     if (action === "reject" && !notes.trim()) {
@@ -20,7 +38,10 @@ export function DecisionModal({ doc, API, onClose, onDecision }) {
 
       const res = await fetch(`${API}/documents/${doc.document_id}/${action}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}` 
+        },
         body: JSON.stringify(body),
       });
       if (!res.ok) {

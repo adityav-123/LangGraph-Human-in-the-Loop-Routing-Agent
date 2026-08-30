@@ -13,7 +13,8 @@ load_dotenv()  # Load .env file into environment variables before other imports
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.api.routes import router
+from backend.api.routes import router as docs_router
+from backend.api.auth import router as auth_router
 from backend.db.database import create_tables
 
 app = FastAPI(
@@ -25,13 +26,14 @@ app = FastAPI(
 # CORS — tighten origins for production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(","),
+    allow_origins=["*"],  # Adjust for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(router, prefix="/api/v1")
+app.include_router(auth_router, prefix="/api/v1")
+app.include_router(docs_router, prefix="/api/v1")
 
 
 @app.on_event("startup")

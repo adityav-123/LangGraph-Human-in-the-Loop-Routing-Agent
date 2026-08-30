@@ -15,6 +15,8 @@ class UploadResponse(BaseModel):
 class DocumentSummary(BaseModel):
     document_id: str
     file_name: str
+    processing_status: str = "uploaded"
+    status_updated_at: str
     doc_type: Optional[str] = None
     urgency: Optional[str] = None
     confidence: Optional[float] = None
@@ -63,8 +65,12 @@ class QueueStats(BaseModel):
     pending: int
     approved: int
     rejected: int
+    processing: int
+    awaiting_review: int
+    failed: int
     by_department: dict[str, int]
     by_urgency: dict[str, int]
+    alerts: list[dict]
 
 
 class ErrorResponse(BaseModel):

@@ -10,7 +10,7 @@ Run this file directly to initialize tables:
 
 import os
 from sqlalchemy import (
-    create_engine, Column, String, Float, Text, DateTime, JSON
+    create_engine, Column, String, Float, Text, JSON, inspect, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.sql import func
@@ -23,6 +23,14 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    username = Column(String, primary_key=True, index=True)
+    hashed_password = Column(String, nullable=False)
+    role = Column(String, nullable=False)  # 'admin' or department name (e.g., 'legal', 'finance')
+
+
 class Document(Base):
     __tablename__ = "documents"
 
@@ -31,6 +39,8 @@ class Document(Base):
     file_path            = Column(String, nullable=False)
     raw_text             = Column(Text, default="")
     uploaded_at          = Column(String, nullable=False)
+    processing_status    = Column(String, nullable=False, default="uploaded")
+    status_updated_at    = Column(String, nullable=False)
 
     # Classification
     doc_type             = Column(String, nullable=True)
@@ -76,7 +86,31 @@ def get_db():
 
 def create_tables():
     Base.metadata.create_all(bind=engine)
+    _ensure_documents_columns()
     print("Tables created.")
+
+
+def _ensure_documents_columns():
+    inspector = inspect(engine)
+    if "documents" not in inspector.get_table_names():
+        return
+
+    columns = {col["name"] for col in inspector.get_columns("documents")}
+    alter_statements = []
+
+    if "processing_status" not in columns:
+        alter_statements.append(
+            "ALTER TABLE documents ADD COLUMN processing_status VARCHAR NOT NULL DEFAULT 'uploaded'"
+        )
+    if "status_updated_at" not in columns:
+        now = datetime.now(timezone.utc).isoformat()
+        alter_statements.append(
+            f"ALTER TABLE documents ADD COLUMN status_updated_at VARCHAR NOT NULL DEFAULT '{now}'"
+        )
+
+    with engine.begin() as conn:
+        for statement in alter_statements:
+            conn.execute(text(statement))
 
 
 if __name__ == "__main__":

@@ -19,15 +19,17 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 
-from backend.db.database import get_db
+from backend.db.database import get_db, User
 from backend.db import crud
 from backend.models.schemas import (
     UploadResponse, DocumentSummary, DocumentDetail,
     ApproveRequest, RejectRequest, RerouteRequest, QueueStats,
 )
+from backend.api.auth import get_current_user
 from backend.utils.ocr import extract_text
 from backend.agents.graph import get_graph
 from backend.agents.state import DocumentState
+from backend.agents.nodes import human_checkpoint, post_approval_action, audit_log
 from datetime import datetime, timezone
 
 router    = APIRouter()
@@ -49,6 +51,8 @@ def _doc_to_summary(doc) -> DocumentSummary:
     return DocumentSummary(
         document_id=doc.document_id,
         file_name=doc.file_name,
+        processing_status=doc.processing_status,
+        status_updated_at=doc.status_updated_at,
         doc_type=doc.doc_type,
         urgency=doc.urgency,
         confidence=doc.confidence,
@@ -75,54 +79,92 @@ def _doc_to_detail(doc) -> DocumentDetail:
     )
 
 
+def _doc_to_state(doc) -> DocumentState:
+    return {
+        "document_id": doc.document_id,
+        "file_name": doc.file_name,
+        "file_path": doc.file_path,
+        "raw_text": doc.raw_text or "",
+        "uploaded_at": doc.uploaded_at,
+        "doc_type": doc.doc_type,
+        "urgency": doc.urgency,
+        "confidence": doc.confidence,
+        "classification_reasoning": doc.classification_reasoning,
+        "parties": doc.parties or [],
+        "key_dates": doc.key_dates or [],
+        "monetary_amounts": doc.monetary_amounts or [],
+        "summary": doc.summary,
+        "assigned_department": doc.assigned_department,
+        "reviewer_id": doc.reviewer_id,
+        "routing_reason": doc.routing_reason,
+        "human_decision": doc.human_decision,
+        "reviewer_notes": doc.reviewer_notes,
+        "decision_at": doc.decision_at,
+        "rerouted_to": doc.rerouted_to,
+        "downstream_action": doc.downstream_action,
+        "action_result": doc.action_result,
+        "audit_trail": doc.audit_trail or [],
+        "error": doc.error,
+        "current_node": doc.current_node,
+        "processing_status": doc.processing_status,
+        "status_updated_at": doc.status_updated_at,
+    }
+
+
 async def _run_graph(doc_id: str, initial_state: DocumentState):
     """
     Background task: runs the LangGraph agent.
     The graph will pause at human_checkpoint automatically.
-    We sync state to Postgres after each node via a custom callback.
-
-    In production, replace the import with a real psycopg connection pool.
+    We sync state to Postgres after each node.
     """
     try:
-        # Import here to avoid circular import at module load
         from backend.db.database import SessionLocal
         import psycopg
 
         db_url = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/docrouting")
-        conn   = psycopg.connect(db_url)
+        conn   = psycopg.connect(db_url, autocommit=True)
         graph  = get_graph(conn)
 
         config = {"configurable": {"thread_id": doc_id}}
-        result = await asyncio.to_thread(graph.invoke, initial_state, config)
 
-        # Sync final state to documents table
-        with SessionLocal() as db:
-            crud.sync_state_to_db(db, doc_id, result)
+        def _collect_events():
+            return list(graph.stream(initial_state, config, stream_mode="values"))
+
+        events = await asyncio.to_thread(_collect_events)
+        for event in events:
+            with SessionLocal() as db:
+                crud.sync_state_to_db(db, doc_id, event)
 
     except Exception as e:
         with SessionLocal() as db:
             doc = crud.get_document(db, doc_id)
             if doc:
                 doc.error = str(e)
+                doc.processing_status = "failed"
+                doc.status_updated_at = datetime.now(timezone.utc).isoformat()
                 db.commit()
 
 
-async def _resume_graph(doc_id: str):
-    """Resume a paused graph after a human decision."""
+async def _resume_graph(doc_id: str, decision: str, notes: str, new_department: str = None):
+    """Continue the post-decision workflow from the persisted document state."""
     try:
         from backend.db.database import SessionLocal
-        import psycopg
-
-        db_url = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/docrouting")
-        conn   = psycopg.connect(db_url)
-        graph  = get_graph(conn)
-
-        config = {"configurable": {"thread_id": doc_id}}
-        # Passing None resumes from the last checkpoint
-        result = await asyncio.to_thread(graph.invoke, None, config)
-
         with SessionLocal() as db:
-            crud.sync_state_to_db(db, doc_id, result)
+            doc = crud.get_document(db, doc_id)
+            if not doc:
+                return
+
+            state = _doc_to_state(doc)
+            state["human_decision"] = decision
+            state["reviewer_notes"] = notes
+            if new_department:
+                state["assigned_department"] = new_department
+                state["rerouted_to"] = new_department
+
+            state.update(human_checkpoint(state))
+            state.update(post_approval_action(state))
+            state.update(audit_log(state))
+            crud.sync_state_to_db(db, doc_id, state)
 
     except Exception as e:
         from backend.db.database import SessionLocal
@@ -130,6 +172,8 @@ async def _resume_graph(doc_id: str):
             doc = crud.get_document(db, doc_id)
             if doc:
                 doc.error = str(e)
+                doc.processing_status = "failed"
+                doc.status_updated_at = datetime.now(timezone.utc).isoformat()
                 db.commit()
 
 
@@ -142,6 +186,7 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     # Validate content type
     if file.content_type not in ALLOWED_TYPES:
@@ -164,7 +209,10 @@ async def upload_document(
         raise HTTPException(status_code=422, detail=f"Text extraction failed: {e}")
 
     # Persist to DB
-    crud.create_document(db, doc_id, file.filename, str(file_path), raw_text)
+    doc = crud.create_document(db, doc_id, file.filename, str(file_path), raw_text)
+    doc.processing_status = "classifying"
+    doc.status_updated_at = datetime.now(timezone.utc).isoformat()
+    db.commit()
 
     # Build initial state
     initial_state: DocumentState = {
@@ -209,16 +257,28 @@ def list_documents(
     limit:      int = 50,
     offset:     int = 0,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if current_user.role != "admin":
+        if department and department != current_user.role:
+            return []
+        department = current_user.role
+
+    # Fix: if decision is 'all', we don't want to filter by decision
+    if decision == "all":
+        decision = None
+
     docs = crud.list_documents(db, department, decision, urgency, limit, offset)
     return [_doc_to_summary(d) for d in docs]
 
 
 @router.get("/documents/{doc_id}", response_model=DocumentDetail)
-def get_document(doc_id: str, db: Session = Depends(get_db)):
+def get_document(doc_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     doc = crud.get_document(db, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    if current_user.role != "admin" and doc.assigned_department != current_user.role:
+        raise HTTPException(status_code=403, detail="Not authorized to view this document")
     return _doc_to_detail(doc)
 
 
@@ -228,15 +288,18 @@ async def approve_document(
     body: ApproveRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     doc = crud.get_document(db, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    if current_user.role != "admin" and doc.assigned_department != current_user.role:
+        raise HTTPException(status_code=403, detail="Not authorized to act on this document")
     if doc.human_decision != "pending":
         raise HTTPException(status_code=409, detail=f"Document already has decision: {doc.human_decision}")
 
     crud.update_human_decision(db, doc_id, "approved", body.reviewer_notes)
-    background_tasks.add_task(_resume_graph, doc_id)
+    background_tasks.add_task(_resume_graph, doc_id, "approved", body.reviewer_notes)
     return _doc_to_summary(crud.get_document(db, doc_id))
 
 
@@ -246,15 +309,18 @@ async def reject_document(
     body: RejectRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     doc = crud.get_document(db, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    if current_user.role != "admin" and doc.assigned_department != current_user.role:
+        raise HTTPException(status_code=403, detail="Not authorized to act on this document")
     if doc.human_decision != "pending":
         raise HTTPException(status_code=409, detail=f"Document already has decision: {doc.human_decision}")
 
     crud.update_human_decision(db, doc_id, "rejected", body.reviewer_notes)
-    background_tasks.add_task(_resume_graph, doc_id)
+    background_tasks.add_task(_resume_graph, doc_id, "rejected", body.reviewer_notes)
     return _doc_to_summary(crud.get_document(db, doc_id))
 
 
@@ -264,18 +330,42 @@ async def reroute_document(
     body: RerouteRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     doc = crud.get_document(db, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    if current_user.role != "admin" and doc.assigned_department != current_user.role:
+        raise HTTPException(status_code=403, detail="Not authorized to act on this document")
     if doc.human_decision != "pending":
         raise HTTPException(status_code=409, detail=f"Document already has decision: {doc.human_decision}")
 
     crud.update_human_decision(db, doc_id, "rerouted", body.reviewer_notes, body.new_department)
-    background_tasks.add_task(_resume_graph, doc_id)
+    background_tasks.add_task(_resume_graph, doc_id, "rerouted", body.reviewer_notes, body.new_department)
     return _doc_to_summary(crud.get_document(db, doc_id))
 
 
 @router.get("/stats", response_model=QueueStats)
-def get_stats(db: Session = Depends(get_db)):
-    return crud.get_queue_stats(db)
+def get_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    stats = crud.get_queue_stats(db)
+    if current_user.role == "admin":
+        return stats
+
+    docs = crud.list_documents(db, department=current_user.role, limit=200)
+    filtered_alerts = [alert for alert in stats["alerts"] if any(d.document_id == alert["document_id"] for d in docs)]
+    return {
+        **stats,
+        "total": len(docs),
+        "pending": sum(1 for d in docs if d.human_decision == "pending"),
+        "approved": sum(1 for d in docs if d.human_decision == "approved"),
+        "rejected": sum(1 for d in docs if d.human_decision == "rejected"),
+        "processing": sum(1 for d in docs if d.processing_status in {"uploaded", "classifying", "extracting_metadata", "routing", "post_approval"}),
+        "awaiting_review": sum(1 for d in docs if d.processing_status == "awaiting_review"),
+        "failed": sum(1 for d in docs if d.processing_status == "failed"),
+        "by_department": {current_user.role: len(docs)},
+        "by_urgency": {
+            urgency: sum(1 for d in docs if d.urgency == urgency)
+            for urgency in sorted({d.urgency for d in docs if d.urgency})
+        },
+        "alerts": filtered_alerts,
+    }

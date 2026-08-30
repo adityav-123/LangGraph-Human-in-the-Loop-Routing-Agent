@@ -15,6 +15,8 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9    # required for UploadFile
 python-dotenv>=1.0.0       # required for loading .env files locally
+PyJWT>=2.8.0               # required for JWT authentication
+passlib[bcrypt]>=1.7.4     # required for password hashing
 
 # Database
 sqlalchemy>=2.0.0

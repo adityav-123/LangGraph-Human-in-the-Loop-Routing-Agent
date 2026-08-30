@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-export function UploadZone({ API, onUploadSuccess }) {
+export function UploadZone({ API, token, onUploadSuccess }) {
   const [uploading, setUploading] = useState(false);
 
   const handleUpload = async (e) => {
@@ -10,7 +10,11 @@ export function UploadZone({ API, onUploadSuccess }) {
     const fd = new FormData();
     fd.append("file", file);
     try {
-      const res = await fetch(`${API}/upload`, { method: "POST", body: fd });
+      const res = await fetch(`${API}/upload`, { 
+        method: "POST", 
+        headers: { "Authorization": `Bearer ${token}` },
+        body: fd 
+      });
       if (!res.ok) throw new Error(await res.text());
       onUploadSuccess();
     } catch (err) {

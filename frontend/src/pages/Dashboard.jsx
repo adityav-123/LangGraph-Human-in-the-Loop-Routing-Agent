@@ -1,4 +1,8 @@
+import { useAuth } from "../components/AuthProvider";
+
 export function Dashboard({ children }) {
+  const { user, logout } = useAuth();
+
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
       <nav className="bg-white border-b border-gray-200">
@@ -11,7 +15,20 @@ export function Dashboard({ children }) {
               <span className="font-bold text-gray-900 text-lg tracking-tight">DocRouter</span>
             </div>
             <div className="flex items-center gap-4">
-              <span className="text-sm font-medium text-gray-500 bg-gray-100 px-3 py-1 rounded-full">v1.0 (Gemini)</span>
+              {user && (
+                <div className="flex items-center gap-4">
+                  <div className="text-right hidden sm:block">
+                    <p className="text-sm font-semibold text-gray-900 leading-tight">{user.username}</p>
+                    <p className="text-xs text-gray-500 capitalize leading-tight">{user.role} role</p>
+                  </div>
+                  <button 
+                    onClick={logout}
+                    className="text-sm font-medium text-gray-600 hover:text-gray-900 border border-gray-200 bg-gray-50 px-3 py-1.5 rounded-lg hover:bg-gray-100 transition-colors"
+                  >
+                    Sign out
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>
